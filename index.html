@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>뷰레이더 · 유튜브 트렌드 분석</title>
+  <meta name="description" content="키워드로 지금 뜨는 유튜브 영상과 채널을 찾고 기여도·성과도·노출확률로 분석하는 도구" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%234b4ae8'/%3E%3Cpath d='M16 16 L16 4 A12 12 0 0 1 27 12 Z' fill='%23ff5a36'/%3E%3Ccircle cx='16' cy='16' r='3' fill='white'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#/videos" aria-label="뷰레이더 홈">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="16" cy="16" r="14" class="bm-ring" />
+          <circle cx="16" cy="16" r="8.5" class="bm-ring2" />
+          <path d="M16 16 L16 2 A14 14 0 0 1 29.3 11.7 Z" class="bm-sweep" />
+          <circle cx="22.5" cy="9.5" r="2.2" class="bm-dot" />
+          <circle cx="16" cy="16" r="2.4" class="bm-core" />
+        </svg>
+        <span class="brand-text"><b>뷰레이더</b><small>ViewRadar</small></span>
+      </a>
+      <nav class="mainnav" aria-label="주 메뉴">
+        <a href="#/videos" data-route="videos">
+          <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M10 9.5v5l4.5-2.5z" class="fill"/></svg>영상 찾기</a>
+        <a href="#/channels" data-route="channels">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="9" r="4"/><path d="M4 20c1.5-3.5 4.5-5 8-5s6.5 1.5 8 5"/></svg>채널 찾기</a>
+        <a href="#/analysis" data-route="analysis">
+          <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>채널 분석</a>
+        <a href="#/saved" data-route="saved">
+          <svg viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4z"/></svg>수집한 영상<span class="nav-count" id="savedCount"></span></a>
+      </nav>
+      <div class="topbar-actions">
+        <button class="mode-badge" id="modeBadge" type="button" title="데이터 모드"></button>
+        <button class="icon-btn" id="themeBtn" type="button" aria-label="화면 테마 전환" title="라이트/다크 전환">
+          <svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+        <button class="icon-btn" id="settingsBtn" type="button" aria-label="설정" title="설정 (API 키)">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="view" class="container" tabindex="-1"></main>
+
+  <footer class="footer container">
+    <span>뷰레이더는 YouTube Data API의 공개 수치로 지표를 추정합니다. 결과는 참고용입니다.</span>
+    <span>YouTube는 Google LLC의 상표입니다.</span>
+  </footer>
+
+  <div id="modalRoot"></div>
+  <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+
+  <script src="js/metrics.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/youtube.js"></script>
+  <script src="js/demo.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
