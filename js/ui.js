@@ -118,9 +118,12 @@
     const lv = metrics.exposureLevel(p);
     return `<span class="exposure e-${lv.key}" data-tip="${esc('추정 ' + p + '% · ' + lv.label)}"><span class="meter"><b style="width:${p}%"></b></span><span class="lbl num">${numeric ? p + '%' : lv.label}</span></span>`;
   }
+  /** 쇼츠 추정: 1분 이하이거나, 3분 이하이면서 제목·태그에 shorts/쇼츠가 있는 영상 */
+  function isShort(v) {
+    return (v.durationSec > 0 && v.durationSec <= 60) || (v.durationSec > 0 && v.durationSec <= 180 && /shorts|쇼츠/i.test(v.title + ' ' + (v.tags || []).join(' ')));
+  }
   function thumbHtml(v) {
-    const isShort = v.durationSec > 0 && v.durationSec <= 180 && /shorts|쇼츠/i.test(v.title + ' ' + (v.tags || []).join(' ')) || (v.durationSec > 0 && v.durationSec <= 60);
-    return `<div class="thumb"><img src="${esc(v.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer" />${isShort ? '<span class="shorts">SHORTS</span>' : ''}<span class="dur">${fmt.duration(v.durationSec)}</span></div>`;
+    return `<div class="thumb"><img src="${esc(v.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer" />${isShort(v) ? '<span class="shorts">SHORTS</span>' : ''}<span class="dur">${fmt.duration(v.durationSec)}</span></div>`;
   }
   function subsText(v) {
     return v.hiddenSubs ? '비공개' : fmt.ko(v.subscriberCount);
@@ -147,7 +150,12 @@
       this.selected = new Set();
       this.view = 'table';
       this.numeric = false;
+      this.pageSize = this.opts.pageSize || 100; // 한 번에 그리는 행 수(표본이 수천 개여도 화면이 느려지지 않게)
+      this.shown = this.pageSize;
+      this._lastItems = null;
     }
+    /** 정렬된 목록 중 지금 화면에 그릴 부분 */
+    visible() { return this.sorted().slice(0, this.shown); }
     /** 화면을 다시 그릴 때마다 새 컨테이너에 연결한다(정렬·선택 상태는 유지). */
     mount(root) {
       this.root = root;
@@ -173,19 +181,23 @@
     selectedItems() { return this.items.filter((v) => this.selected.has(v.id)); }
     render() {
       if (!this.root) return;
+      if (this._lastItems !== this.items) { this._lastItems = this.items; this.shown = this.pageSize; }
       if (!this.items.length) { this.root.innerHTML = this.opts.emptyHtml || ''; return; }
-      this.root.innerHTML = this.view === 'card' ? this.cardsHtml() : this.tableHtml();
+      const rest = this.items.length - this.shown;
+      this.root.innerHTML = (this.view === 'card' ? this.cardsHtml() : this.tableHtml()) +
+        (rest > 0 ? `<div class="load-more"><button class="btn" type="button" data-showmore>${Math.min(rest, this.pageSize)}개 더 보기 <span class="muted">(${fmt.int(this.shown)} / ${fmt.int(this.items.length)})</span></button></div>` : '');
     }
     tableHtml() {
       const n = this.numeric;
-      const all = this.items.length && this.items.every((v) => this.selected.has(v.id));
+      const vis = this.visible();
+      const all = vis.length && vis.every((v) => this.selected.has(v.id));
       const head = COLS.map((c) => {
         const sorted = this.sort.key === c.key;
         const arrow = sorted ? (this.sort.dir === 1 ? '▲' : '▼') : '↕';
         return `<th class="sortable ${sorted ? 'sorted' : ''}" data-sort="${c.key}" aria-sort="${sorted ? (this.sort.dir === 1 ? 'ascending' : 'descending') : 'none'}">${c.label}${c.tip ? `<span class="help" data-tip="${esc(c.tip)}">?</span>` : ''}<span class="arrow">${arrow}</span></th>`;
       }).join('');
       const extraHead = this.opts.extra === 'saved' ? '<th>메모</th><th></th>' : '';
-      const rows = this.sorted().map((v) => {
+      const rows = vis.map((v) => {
         const sel = this.selected.has(v.id);
         const extra = this.opts.extra === 'saved'
           ? `<td><input class="memo" data-memo="${esc(v.id)}" value="${esc(v.memo || '')}" placeholder="메모 추가" aria-label="메모" /></td><td><button class="btn btn-sm btn-ghost" data-remove="${esc(v.id)}" aria-label="삭제">삭제</button></td>`
@@ -211,7 +223,7 @@
     }
     cardsHtml() {
       const n = this.numeric;
-      return `<div class="cards">${this.sorted().map((v) => {
+      return `<div class="cards">${this.visible().map((v) => {
         const sel = this.selected.has(v.id);
         return `<article class="card ${sel ? 'selected' : ''}" data-id="${esc(v.id)}">
           ${this.opts.selectable ? `<label class="card-check"><input type="checkbox" class="check" data-check="${esc(v.id)}" ${sel ? 'checked' : ''} aria-label="선택" /></label>` : ''}
@@ -237,6 +249,7 @@
         this.render();
         return;
       }
+      if (e.target.closest('[data-showmore]')) { this.shown += this.pageSize; this.render(); return; }
       if (e.target.closest('input, label.card-check, .memo, .col-check')) return;
       const rm = e.target.closest('[data-remove]');
       if (rm) { if (this.opts.onRemove) this.opts.onRemove(rm.getAttribute('data-remove')); return; }
@@ -249,7 +262,7 @@
     onChange(e) {
       const t = e.target;
       if (t.hasAttribute('data-checkall')) {
-        if (t.checked) this.items.forEach((v) => this.selected.add(v.id)); else this.selected.clear();
+        if (t.checked) this.visible().forEach((v) => this.selected.add(v.id)); else this.selected.clear();
         this.render();
       } else if (t.hasAttribute('data-check')) {
         const id = t.getAttribute('data-check');
@@ -257,7 +270,7 @@
         const row = t.closest('[data-id]');
         if (row) row.classList.toggle('selected', t.checked);
         const all = this.root.querySelector('[data-checkall]');
-        if (all) all.checked = this.items.every((v) => this.selected.has(v.id));
+        if (all) all.checked = this.visible().every((v) => this.selected.has(v.id));
       } else if (t.hasAttribute('data-memo')) {
         if (this.opts.onMemo) this.opts.onMemo(t.getAttribute('data-memo'), t.value);
         return;
@@ -344,5 +357,5 @@
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
   }
 
-  window.VR.ui = { esc, h, toast, modal, confirmDialog, promptDialog, gradeHtml, exposureHtml, thumbHtml, subsText, VideoList, skeletonTable, growthChartSvg, barChartSvg, downloadCsv, TIPS };
+  window.VR.ui = { esc, h, toast, modal, confirmDialog, promptDialog, gradeHtml, exposureHtml, thumbHtml, isShort, subsText, VideoList, skeletonTable, growthChartSvg, barChartSvg, downloadCsv, TIPS };
 })();

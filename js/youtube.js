@@ -11,7 +11,27 @@
     return e;
   }
 
+  // ---------- 할당량 추정(이 브라우저에서 보낸 요청 기준, 태평양 시간 자정에 초기화) ----------
+  const COST = { search: 100 };
+  function ptDay() {
+    try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date()); }
+    catch (e) { return new Date().toISOString().slice(0, 10); }
+  }
+  function track(endpoint) {
+    const store = window.VR.store;
+    if (!store) return;
+    const d = ptDay();
+    const q = store.get('quota', {});
+    const used = (q.day === d ? q.used : 0) + (COST[endpoint] || 1);
+    store.set('quota', { day: d, used });
+  }
+  function quotaUsed() {
+    const q = window.VR.store ? window.VR.store.get('quota', {}) : {};
+    return q.day === ptDay() ? q.used : 0;
+  }
+
   async function call(key, endpoint, params) {
+    track(endpoint);
     const url = new URL(BASE + endpoint);
     Object.entries(Object.assign({}, params, { key })).forEach(([k, v]) => {
       if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
@@ -135,11 +155,17 @@
         res.totalResults = r.pageInfo ? r.pageInfo.totalResults : videos.length;
         return res;
       },
-      async hotVideos({ region, pageToken }) {
-        const r = await call(key, 'videos', { part: 'snippet,statistics,contentDetails', chart: 'mostPopular', regionCode: region, maxResults: 50, pageToken });
-        const res = await withChannels(key, r.items.map(normVideo));
+      /** 인기 급상승 차트. category를 주면 그 카테고리의 인기 영상(카테고리마다 최대 200개). */
+      async hotVideos({ region, category, pageToken }) {
+        const r = await call(key, 'videos', { part: 'snippet,statistics,contentDetails', chart: 'mostPopular', regionCode: region, videoCategoryId: category || undefined, maxResults: 50, pageToken });
+        const res = await withChannels(key, (r.items || []).map(normVideo));
         res.nextPageToken = r.nextPageToken || null;
         return res;
+      },
+      /** 이 국가에서 쓸 수 있는 영상 카테고리 목록 */
+      async categories(region) {
+        const r = await call(key, 'videoCategories', { part: 'snippet', regionCode: region, hl: 'ko' });
+        return (r.items || []).filter((c) => c.snippet && c.snippet.assignable).map((c) => ({ id: c.id, title: c.snippet.title }));
       },
       async searchChannels({ q, region, pageToken }) {
         const r = await call(key, 'search', { part: 'snippet', type: 'channel', q, maxResults: 50, regionCode: region, pageToken });
@@ -197,5 +223,5 @@
   }
 
   window.VR = window.VR || {};
-  window.VR.youtube = { create };
+  window.VR.youtube = { create, quotaUsed, DAILY_QUOTA: 10000 };
 })();

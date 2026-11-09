@@ -67,25 +67,32 @@
 
   // ---------- 조회수 스냅샷(실측 노출 속도) ----------
   const MIN_GAP_MS = 20 * 60 * 1000;
-  function measure(videoId, views) {
+  const MAX_SNAPS = 8000;
+  /** 여러 영상의 조회수를 한 번에 기록하고 { 영상ID: 실측값|null }을 돌려준다. */
+  function measureMany(pairs) {
     const snaps = get('snaps', {});
     const now = Date.now();
-    const prev = snaps[videoId];
-    let measured = null;
-    if (prev && now - prev.t >= MIN_GAP_MS && views >= prev.v) {
-      const hours = (now - prev.t) / 3600000;
-      measured = { perHour: (views - prev.v) / hours, hours: hours, since: prev.t, delta: views - prev.v };
+    const out = {};
+    for (const { id, views } of pairs) {
+      const prev = snaps[id];
+      let measured = null;
+      if (prev && now - prev.t >= MIN_GAP_MS && views >= prev.v) {
+        const hours = (now - prev.t) / 3600000;
+        measured = { perHour: (views - prev.v) / hours, hours: hours, since: prev.t, delta: views - prev.v };
+      }
+      if (!prev || now - prev.t >= MIN_GAP_MS) snaps[id] = { t: now, v: views, m: measured };
+      else if (prev.m) measured = prev.m;
+      out[id] = measured;
     }
-    if (!prev || now - prev.t >= MIN_GAP_MS) snaps[videoId] = { t: now, v: views, m: measured };
-    else if (prev.m) measured = prev.m;
     const keys = Object.keys(snaps);
-    if (keys.length > 3000) {
-      keys.sort((a, b) => snaps[a].t - snaps[b].t).slice(0, keys.length - 3000).forEach((k) => delete snaps[k]);
+    if (keys.length > MAX_SNAPS) {
+      keys.sort((a, b) => snaps[a].t - snaps[b].t).slice(0, keys.length - MAX_SNAPS).forEach((k) => delete snaps[k]);
     }
     set('snaps', snaps);
-    return measured;
+    return out;
   }
+  function measure(videoId, views) { return measureMany([{ id: videoId, views }])[videoId]; }
 
   window.VR = window.VR || {};
-  window.VR.store = { get, set, settings, saveSettings, folders, saveFolders, addToFolder, createFolder, channels, saveChannels, addChannel, measure };
+  window.VR.store = { get, set, settings, saveSettings, folders, saveFolders, addToFolder, createFolder, channels, saveChannels, addChannel, measure, measureMany };
 })();

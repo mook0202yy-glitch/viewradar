@@ -76,6 +76,19 @@
   const CH_PREFIX = ['일상', '데일리', '하루', '찐', '오늘의', '슬기로운', '똑똑한', '떠나는', '먹는', '성장하는', '주말', '퇴근후', '반짝', '느린', '알찬'];
   const CH_SUFFIX = ['연구소', 'TV', '로그', '채널', '스튜디오', '클래스', '랩', '다이어리', '라이프', '하우스', '노트', '튜브'];
   const HOT_TOPICS = ['아이돌 컴백', '야구 하이라이트', '먹방', '게임 공략', '자취 요리', '주식 뉴스', '여행 브이로그', '예능 클립', '운동 루틴', '테크 리뷰', '반려견', '드라마 요약'];
+  const DEMO_CATEGORIES = [
+    { id: '1', title: '영화/애니메이션' }, { id: '2', title: '자동차/교통' }, { id: '10', title: '음악' }, { id: '15', title: '애완동물/동물' },
+    { id: '17', title: '스포츠' }, { id: '19', title: '여행/이벤트' }, { id: '20', title: '게임' }, { id: '22', title: '인물/블로그' },
+    { id: '23', title: '코미디' }, { id: '24', title: '엔터테인먼트' }, { id: '25', title: '뉴스/정치' }, { id: '26', title: '노하우/스타일' },
+    { id: '27', title: '교육' }, { id: '28', title: '과학기술' },
+  ];
+  const HOT_BY_CATEGORY = {
+    1: ['애니 리뷰', '영화 결말', '드라마 요약'], 2: ['전기차 리뷰', '중고차', '자동차 꿀팁'], 10: ['아이돌 컴백', '커버곡', '플레이리스트'],
+    15: ['반려견', '고양이', '강아지 훈련'], 17: ['야구 하이라이트', '축구', '운동 루틴'], 19: ['여행 브이로그', '제주 여행', '일본 여행'],
+    20: ['게임 공략', '신작 게임', '롤 하이라이트'], 22: ['일상 브이로그', '자취 요리', '퇴근 후 루틴'], 23: ['예능 클립', '콩트', '몰래카메라'],
+    24: ['예능 클립', '연예 뉴스', '챌린지'], 25: ['주식 뉴스', '경제 뉴스', '부동산'], 26: ['메이크업', '자취 인테리어', '홈카페'],
+    27: ['영어 공부', '공부 브이로그', '역사 이야기'], 28: ['테크 리뷰', 'AI 툴', '아이폰 꿀팁'],
+  };
 
   const registry = loadRegistry();
   function loadRegistry() {
@@ -157,23 +170,29 @@
         const channels = Object.fromEntries(pool.map((c) => [c.id, c]));
         return { videos, channels, nextPageToken: page < 4 ? 'p' + (page + 1) : null, totalResults: 200 };
       },
-      async hotVideos({ pageToken }) {
-        await delay(300);
+      async hotVideos({ category, pageToken }) {
+        await delay(120);
         const page = pageToken ? +pageToken.slice(1) : 1;
         const day = new Date().toISOString().slice(0, 10);
-        const r = rng('hot:' + day + ':' + page);
-        const pool = Array.from({ length: 40 }, (_, i) => {
-          const c = makeChannel('hot:' + i);
-          return c;
-        });
+        const cat = category || '';
+        const r = rng('hot:' + day + ':' + cat + ':' + page);
+        const topics = HOT_BY_CATEGORY[cat] || HOT_TOPICS;
+        const pool = Array.from({ length: 60 }, (_, i) => makeChannel('hot:' + cat + ':' + i));
+        const pages = cat ? 1 + (hashStr(cat) % 4) : 4; // 카테고리마다 차트 길이가 다르다
         const videos = Array.from({ length: 50 }, (_, i) => {
-          const v = makeVideo(r, r.pick(HOT_TOPICS), r.pick(pool), { period: 'week' }, page * 100 + i);
+          const v = makeVideo(r, r.pick(topics), r.pick(pool), { period: 'week' }, page * 100 + i);
           v.viewCount = Math.round(v.viewCount * r.int(3, 12));
+          v.categoryId = cat || r.pick(DEMO_CATEGORIES).id;
+          v.id = idFrom('', 'hot' + cat + page + i + v.channelId, 11);
           return v;
         });
         saveRegistry();
         sortVideos(videos, 'viewCount');
-        return { videos, channels: Object.fromEntries(pool.map((c) => [c.id, c])), nextPageToken: page < 2 ? 'p' + (page + 1) : null };
+        return { videos, channels: Object.fromEntries(pool.map((c) => [c.id, c])), nextPageToken: page < pages ? 'p' + (page + 1) : null };
+      },
+      async categories() {
+        await delay(80);
+        return DEMO_CATEGORIES.slice();
       },
       async searchChannels({ q, pageToken }) {
         await delay(300);

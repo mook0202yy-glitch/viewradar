@@ -1,6 +1,6 @@
 /* 뷰레이더 앱: 라우팅과 각 화면(영상 찾기 / 채널 찾기 / 채널 분석 / 수집한 영상) */
 (function () {
-  const { metrics, fmt, store, ui } = window.VR;
+  const { metrics, fmt, store, ui, pool } = window.VR;
   const { esc, h, toast, modal } = ui;
   const view = document.getElementById('view');
 
@@ -20,6 +20,7 @@
     refresh: '<svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>',
     trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
     plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+    target: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>',
   };
 
   // ---------- 전역 상태 ----------
@@ -29,10 +30,11 @@
     videos: {
       q: '', order: 'relevance', period: 'any', duration: 'any', hot: false, title: '',
       raw: [], channels: {}, nextPageToken: null, loading: false, error: '', searched: false,
-      showFilters: false, keywords: [],
+      showFilters: false, keywords: [], categories: [], hotCat: '', progress: '',
       filters: { minViews: '', maxViews: '', minSubs: '', maxSubs: '', cg: [], pg: [], ex: [] },
       list: null,
     },
+    outliers: { busy: false, progress: '', pct: 0, list: null, sort: null },
     channels: { q: '', items: [], nextPageToken: null, loading: false, error: '', searched: false, minSubs: '', maxSubs: '', sort: { key: null, dir: -1 } },
     analysis: { selectedId: null, cache: {}, loading: false, error: '', list: null },
     saved: { folderId: 'default', list: null },
@@ -53,14 +55,96 @@
   }
 
   function enrichAll(videos, channels) {
+    const measured = S.provider.mode === 'api' ? store.measureMany(videos.map((v) => ({ id: v.id, views: v.viewCount }))) : {};
     return videos.map((v) => {
       const ch = channels[v.channelId];
-      const measured = S.provider.mode === 'api' ? store.measure(v.id, v.viewCount) : null;
-      const e = metrics.enrich(v, ch, measured);
+      const m = measured[v.id] || null;
+      const e = metrics.enrich(v, ch, m);
       e.channelThumb = ch ? ch.thumbnail : '';
-      e.measured = measured;
+      e.measured = m;
       return e;
     });
+  }
+
+  // ---------- 표본 모으기(핫 비디오 전체, 키워드 깊게 검색) ----------
+  const FATAL = ['quotaExceeded', 'dailyLimitExceeded', 'rateLimitExceeded', 'keyInvalid', 'accessNotConfigured', 'ipRefererBlocked', 'forbidden', 'network'];
+
+  /** 작업을 최대 limit개씩 동시에 실행한다. */
+  async function runLimited(items, limit, fn) {
+    let next = 0;
+    const worker = async () => { while (next < items.length) await fn(items[next++]); };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  }
+
+  /** 핫 비디오 전체: 국가 전체 차트와 카테고리별 차트를 각각 끝까지(차트마다 최대 200개) 모은다. 약 60~150유닛. */
+  async function collectHot(region, onProgress) {
+    const provider = S.provider;
+    let cats = [];
+    try { cats = await provider.categories(region); } catch (e) { if (FATAL.includes(e.reason)) throw e; }
+    const targets = [{ id: '', title: '전체' }].concat(cats);
+    const videos = new Map();
+    const channels = {};
+    const seenCats = new Set();
+    let done = 0;
+    const report = () => onProgress && onProgress({ done, total: targets.length, videos: videos.size });
+    await runLimited(targets, 4, async (cat) => {
+      let token = null;
+      let pages = 0;
+      do {
+        let res;
+        try { res = await provider.hotVideos({ region, category: cat.id, pageToken: token || undefined }); }
+        catch (e) { if (FATAL.includes(e.reason) || !cat.id) throw e; break; } // 차트가 없는 카테고리는 건너뛴다
+        res.videos.forEach((v) => { if (!videos.has(v.id)) videos.set(v.id, v); if (v.categoryId) seenCats.add(String(v.categoryId)); });
+        Object.assign(channels, res.channels);
+        await pool.add(provider.mode, res.videos, res.channels);
+        token = res.nextPageToken;
+        pages++;
+        report();
+      } while (token && pages < 4);
+      done++;
+      report();
+    });
+    return { videos: [...videos.values()], channels, categories: cats.filter((c) => seenCats.has(String(c.id))) };
+  }
+
+  const DEPTHS = {
+    quick: { label: '빠르게', orders: ['relevance'], pages: 1 },
+    normal: { label: '보통', orders: ['relevance', 'viewCount', 'date'], pages: 1 },
+    deep: { label: '많이', orders: ['relevance', 'viewCount', 'date'], pages: 3 },
+  };
+  /** search.list 100유닛 + 영상·채널 상세 약 2유닛 */
+  function searchCost(depth, nKeywords) {
+    const d = DEPTHS[depth] || DEPTHS.normal;
+    return nKeywords * d.orders.length * d.pages * 102;
+  }
+  function splitKeywords(s) {
+    return [...new Set(String(s || '').split(/[,\n]/).map((x) => x.trim()).filter(Boolean))].slice(0, 10);
+  }
+
+  /** 키워드마다 관련도·조회수·최신 정렬로 여러 페이지를 검색해 표본에 더한다. */
+  async function collectSearch(keywords, opts, onProgress) {
+    const d = DEPTHS[opts.depth] || DEPTHS.normal;
+    const provider = S.provider;
+    const jobs = [];
+    keywords.forEach((q) => d.orders.forEach((order) => jobs.push({ q, order })));
+    const videos = new Map();
+    let done = 0;
+    await runLimited(jobs, 3, async (job) => {
+      let token = null;
+      for (let p = 0; p < d.pages; p++) {
+        let res;
+        try { res = await provider.searchVideos({ q: job.q, region: opts.region, order: job.order, period: opts.period, duration: 'any', pageToken: token || undefined }); }
+        catch (e) { if (e.reason !== 'notFound') throw e; break; } // 키 오류·할당량 초과 등은 중단하고 알린다
+        res.videos.forEach((v) => videos.set(v.id, v));
+        await pool.add(provider.mode, res.videos, res.channels);
+        if (onProgress) onProgress({ done: done + (p + 1) / d.pages, total: jobs.length, videos: videos.size });
+        token = res.nextPageToken;
+        if (!token) break;
+      }
+      done++;
+      if (onProgress) onProgress({ done, total: jobs.length, videos: videos.size });
+    });
+    return { videos: [...videos.values()] };
   }
 
   /** "10만", "1.5억", "3천", "5k", "1,000" 같은 입력을 숫자로 */
@@ -193,6 +277,7 @@
     const minV = parseKo(f.minViews), maxV = parseKo(f.maxViews), minS = parseKo(f.minSubs), maxS = parseKo(f.maxSubs);
     const d = S.videos.duration;
     return S.videos.raw.filter((v) => {
+      if (S.videos.hot && S.videos.hotCat && String(v.categoryId) !== S.videos.hotCat) return false;
       if (minV != null && v.viewCount < minV) return false;
       if (maxV != null && v.viewCount > maxV) return false;
       if (minS != null && v.subscriberCount < minS) return false;
@@ -237,19 +322,34 @@
     if (q != null) V.q = q.trim();
     if (!opts.hot && !V.q) { toast('검색어를 입력해 주세요.'); return; }
     V.hot = !!opts.hot;
-    V.loading = true; V.error = ''; V.searched = true;
-    if (!opts.more) { V.raw = []; V.channels = {}; V.nextPageToken = null; V.keywords = []; videoList().sort = { key: null, dir: -1 }; }
+    V.loading = true; V.error = ''; V.searched = true; V.progress = '';
+    if (!opts.more) { V.raw = []; V.channels = {}; V.nextPageToken = null; V.keywords = []; V.categories = []; V.hotCat = ''; videoList().sort = { key: null, dir: -1 }; }
     if (location.hash !== '#/videos') location.hash = '#/videos'; else renderVideos();
     try {
-      const params = { q: V.q, region: S.settings.region, order: V.order, period: V.period, duration: V.duration, pageToken: opts.more ? V.nextPageToken : undefined };
-      const res = V.hot ? await S.provider.hotVideos(params) : await S.provider.searchVideos(params);
-      Object.assign(V.channels, res.channels);
-      const enriched = enrichAll(res.videos, V.channels);
-      const ids = new Set(V.raw.map((v) => v.id));
-      V.raw = V.raw.concat(enriched.filter((v) => !ids.has(v.id)));
-      V.nextPageToken = res.nextPageToken;
-      V.title = V.hot ? `${fmt.date(new Date().toISOString())} 인기 급상승 · ${regionName(S.settings.region)}` : `‘${V.q}’ 검색 결과`;
-      V.keywords = V.hot ? [] : computeKeywords(V.raw, V.q);
+      if (V.hot) {
+        const res = await collectHot(S.settings.region, (p) => {
+          V.progress = `카테고리 ${p.done}/${p.total} · 영상 ${fmt.int(p.videos)}개`;
+          const el = document.getElementById('vProgress');
+          if (el) el.textContent = V.progress;
+        });
+        V.channels = res.channels;
+        V.raw = enrichAll(res.videos, V.channels);
+        V.categories = res.categories;
+        V.nextPageToken = null;
+        V.title = `${fmt.date(new Date().toISOString())} 인기 급상승 전체 · ${regionName(S.settings.region)}`;
+        V.keywords = [];
+      } else {
+        const params = { q: V.q, region: S.settings.region, order: V.order, period: V.period, duration: V.duration, pageToken: opts.more ? V.nextPageToken : undefined };
+        const res = await S.provider.searchVideos(params);
+        pool.add(S.provider.mode, res.videos, res.channels);
+        Object.assign(V.channels, res.channels);
+        const enriched = enrichAll(res.videos, V.channels);
+        const ids = new Set(V.raw.map((v) => v.id));
+        V.raw = V.raw.concat(enriched.filter((v) => !ids.has(v.id)));
+        V.nextPageToken = res.nextPageToken;
+        V.title = `‘${V.q}’ 검색 결과`;
+        V.keywords = computeKeywords(V.raw, V.q);
+      }
     } catch (e) {
       V.error = errMsg(e);
       toast(V.error, 'err');
@@ -272,6 +372,7 @@
           <li><span class="fi" style="background:var(--e-high)">노출</span><div><b>노출확률</b><span>지금도 추천 알고리즘을 타고 있을 가능성(추정)</span></div></li>
         </ul>
         <div class="examples" style="margin-top:18px"><span class="label muted" style="font-size:12px;font-weight:700">이렇게 시작해 보세요</span>${EXAMPLES.map((k) => `<button class="chip" data-example="${esc(k)}">${esc(k)}</button>`).join('')}</div>
+        <a class="btn btn-primary" href="#/outliers" style="margin-top:16px">${ICON.target}나와 비슷한 규모 채널의 아웃라이어 찾기</a>
       </div>
       <svg class="radar-art" viewBox="0 0 360 360" aria-hidden="true">
         <defs><radialGradient id="sweepGrad" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(180 180) scale(170)"><stop offset="0" stop-color="var(--primary)" stop-opacity=".0"/><stop offset="1" stop-color="var(--primary)" stop-opacity=".35"/></radialGradient></defs>
@@ -327,7 +428,7 @@
     if (!V.searched) {
       body.innerHTML = heroHtml();
     } else if (V.loading && !V.raw.length) {
-      body.innerHTML = `<div class="toolbar"><div class="result-title">${V.hot ? '인기 급상승 영상을 불러오는 중…' : `‘${esc(V.q)}’ 검색 중…`}</div></div>${ui.skeletonTable(7)}`;
+      body.innerHTML = `<div class="toolbar"><div class="result-title">${V.hot ? '인기 급상승 영상을 카테고리별로 모으는 중… <small id="vProgress">' + esc(V.progress) + '</small>' : `‘${esc(V.q)}’ 검색 중…`}</div></div>${ui.skeletonTable(7)}`;
     } else if (V.error && !V.raw.length) {
       body.innerHTML = `<div class="empty" style="margin-top:18px"><b>결과를 불러오지 못했습니다</b>${esc(V.error)}<br/><button class="btn" id="openSettings2">설정 열기</button></div>`;
     } else if (!V.raw.length) {
@@ -336,7 +437,7 @@
       const items = filteredVideos();
       body.innerHTML = `
         <div class="toolbar">
-          <div class="result-title">${esc(V.title)} <small>${items.length === V.raw.length ? `${items.length}개` : `${V.raw.length}개 중 ${items.length}개 표시`}</small></div>
+          <div class="result-title">${esc(V.title)} <small>${items.length === V.raw.length ? `${fmt.int(items.length)}개` : `${fmt.int(V.raw.length)}개 중 ${fmt.int(items.length)}개 표시`}</small></div>
           <div class="spacer"></div>
           <span class="muted" id="selInfo" style="font-size:12.5px"></span>
           <button class="btn btn-sm" id="collectBtn">${ICON.save}영상 수집</button>
@@ -346,6 +447,8 @@
           <button class="btn btn-sm ${S.settings.numeric ? 'toggled' : ''}" id="numBtn" data-tip="기여도·성과도·노출확률을 수치로 표시">123</button>
         </div>
         ${V.keywords.length ? `<div class="keywords-bar"><span class="kb-label">${ICON.spark}추천 키워드</span>${V.keywords.map((k) => `<button class="chip" data-kw="${esc(k.word)}">${esc(k.word)} <span class="cnt">${k.n}</span></button>`).join('')}</div>` : ''}
+        ${V.hot && V.categories.length ? `<div class="keywords-bar"><span class="kb-label">${ICON.fire}카테고리</span><button class="chip ${V.hotCat ? '' : 'on'}" data-cat="">전체 <span class="cnt">${fmt.int(V.raw.length)}</span></button>${V.categories.map((c) => { const n = V.raw.filter((v) => String(v.categoryId) === String(c.id)).length; return n ? `<button class="chip ${V.hotCat === String(c.id) ? 'on' : ''}" data-cat="${esc(c.id)}">${esc(c.title)} <span class="cnt">${fmt.int(n)}</span></button>` : ''; }).join('')}</div>` : ''}
+        ${V.hot ? `<div class="callout" style="margin-bottom:12px">나와 비슷한 규모의 채널만 보려면 <a href="#/outliers"><b>아웃라이어 찾기</b></a>로 가세요. 여기서 불러온 영상은 아웃라이어 찾기 표본에 자동으로 쌓였습니다.</div>` : ''}
         <div id="vList"></div>
         <div class="load-more">${V.nextPageToken ? `<button class="btn" id="moreBtn" ${V.loading ? 'disabled' : ''}>${V.loading ? '불러오는 중…' : '50개 더 불러오기'}</button>` : ''}</div>`;
       list.items = items;
@@ -400,6 +503,7 @@
     });
     view.querySelectorAll('[data-example]').forEach((b) => b.addEventListener('click', () => runVideoSearch(b.getAttribute('data-example'))));
     view.querySelectorAll('[data-kw]').forEach((b) => b.addEventListener('click', () => runVideoSearch(b.getAttribute('data-kw'))));
+    view.querySelectorAll('[data-cat]').forEach((b) => b.addEventListener('click', () => { V.hotCat = b.getAttribute('data-cat'); renderVideos(); }));
     const more = view.querySelector('#moreBtn');
     if (more) more.addEventListener('click', () => runVideoSearch(null, { more: true, hot: V.hot }));
     const num = view.querySelector('#numBtn');
@@ -526,6 +630,7 @@
     renderAnalysis();
     try {
       const { channel, videos } = await S.provider.channelVideos(id, 50);
+      pool.add(S.provider.mode, videos, { [channel.id]: channel });
       const enriched = enrichAll(videos, { [channel.id]: channel });
       A.cache[id] = { channel, videos: enriched, at: Date.now() };
       store.addChannel(channel);
@@ -742,6 +847,254 @@
   }
 
   // ======================================================================
+  // 아웃라이어 찾기: 누적 표본에서 나와 비슷한 규모 채널의 터진 영상
+  // ======================================================================
+  const OUTLIER_DEFAULTS = { minSubs: '', maxSubs: '1만', mult: 5, period: 'quarter', format: 'all', minViews: '', kw: '', kws: '', depth: 'normal' };
+  const SUB_PRESETS = [['', '1천', '1천 이하'], ['1천', '1만', '1천~1만'], ['1만', '5만', '1만~5만'], ['5만', '10만', '5만~10만'], ['10만', '', '10만 이상']];
+  const MULTS = [2, 3, 5, 10, 30];
+  const PERIODS = [['week', '1주'], ['month', '1개월'], ['quarter', '3개월'], ['year', '1년'], ['any', '전체']];
+  const FORMATS = [['all', '전체'], ['long', '롱폼만'], ['shorts', '쇼츠만']];
+
+  function outlierSettings() { return Object.assign({}, OUTLIER_DEFAULTS, S.settings.outlier || {}); }
+  function saveOutlier(patch) { S.settings = store.saveSettings({ outlier: Object.assign(outlierSettings(), patch) }); }
+
+  function outlierList() {
+    if (!S.outliers.list) {
+      S.outliers.list = new ui.VideoList({ onOpen: openVideo, onSelect: (n) => { const el = document.getElementById('olSel'); if (el) el.textContent = n ? `${n}개 선택됨` : ''; }, pageSize: 60 });
+      S.outliers.list.sort = { key: 'contribution', dir: -1 };
+    }
+    return S.outliers.list;
+  }
+
+  /** 표본에서 조건(구독자 범위·기간·형식·키워드)에 맞는 영상을 고르고, 그중 조회수 ≥ 구독자 × N인 영상만 남긴다. */
+  function computeOutliers(p, O) {
+    const minS = parseKo(O.minSubs), maxS = parseKo(O.maxSubs), minV = parseKo(O.minViews);
+    const maxAge = { week: 7, month: 30, quarter: 90, year: 365 }[O.period];
+    const now = Date.now();
+    const kws = splitKeywords(O.kw).map((k) => k.toLowerCase());
+    const chans = new Set();
+    let matched = 0;
+    const items = [];
+    for (const v of p.videos.values()) {
+      const ch = p.channels.get(v.channelId);
+      if (!ch || ch.hiddenSubscriberCount || !ch.subscriberCount) continue;
+      if (minS != null && ch.subscriberCount < minS) continue;
+      if (maxS != null && ch.subscriberCount > maxS) continue;
+      if (maxAge && now - new Date(v.publishedAt).getTime() > maxAge * 86400000) continue;
+      if (O.format === 'long' && ui.isShort(v)) continue;
+      if (O.format === 'shorts' && !ui.isShort(v)) continue;
+      if (kws.length) {
+        const text = (v.title + ' ' + (v.tags || []).join(' ') + ' ' + v.channelTitle).toLowerCase();
+        if (!kws.some((k) => text.includes(k))) continue;
+      }
+      matched++;
+      chans.add(ch.id);
+      if (minV != null && v.viewCount < minV) continue;
+      if (v.viewCount < ch.subscriberCount * O.mult) continue;
+      const e = metrics.enrich(v, ch, null);
+      e.channelThumb = ch.thumbnail;
+      items.push(e);
+    }
+    return { matched, channels: chans.size, items };
+  }
+
+  function progressHtml() {
+    const st = S.outliers;
+    return st.progress ? `<div class="ol-progress"><i style="width:${st.pct}%"></i></div><div class="ol-ptext">${esc(st.progress)}</div>` : '';
+  }
+
+  function renderOutliers() {
+    const O = outlierSettings();
+    const st = S.outliers;
+    const isApi = S.provider.mode === 'api';
+    const kws = splitKeywords(O.kws);
+    const est = searchCost(O.depth, Math.max(1, kws.length));
+    const dis = st.busy ? 'disabled' : '';
+    const seg = (name, opts, cur) => `<div class="segmented" data-oseg="${name}">${opts.map(([k, l]) => `<button type="button" data-v="${k}" class="${String(cur) === String(k) ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+    view.innerHTML = `
+      <div class="page-head"><div><h2>아웃라이어 찾기</h2><p>나와 비슷한 규모의 채널에서 <b>구독자 수보다 훨씬 많이 본 영상</b>을 찾습니다. 표본이 클수록 더 많이 찾습니다.</p></div></div>
+      <div class="ol-grid">
+        <section class="panel">
+          <div class="panel-h"><h3>1. 표본 모으기</h3><span class="muted" style="font-size:12.5px" id="olStat">표본 확인 중…</span></div>
+          <div class="panel-b">
+            <div class="ol-src">
+              <div class="ol-src-t"><b>${ICON.fire}핫 비디오 전체</b><p>${esc(regionName(S.settings.region))} 인기 급상승을 카테고리별로 끝까지 모읍니다. 수천 개${isApi ? ' · 약 60~150유닛' : ''}</p></div>
+              <button class="btn" type="button" id="olHot" ${dis}>모으기</button>
+            </div>
+            <form class="ol-src" id="olSearch">
+              <div class="ol-src-t"><b>${ICON.search}키워드 깊게 검색</b><p>내 분야 키워드를 쉼표로 여러 개 넣으세요. 게시 기간은 ‘2. 조건’을 따릅니다.</p>
+                <div class="ol-search-row"><input class="input" name="kws" value="${esc(O.kws)}" placeholder="예: 홈카페, 자취 요리, 퇴근 후 브이로그" autocomplete="off" aria-label="표본 키워드"/>${seg('depth', Object.entries(DEPTHS).map(([k, d]) => [k, d.label]), O.depth)}</div>
+              </div>
+              <button class="btn btn-primary" type="submit" ${dis}>모으기${isApi ? `<small id="olCost">약 ${fmt.int(est)}유닛</small>` : ''}</button>
+            </form>
+            <div id="olProg">${progressHtml()}</div>
+            <div class="ol-foot">
+              <span>${isApi ? `오늘 이 브라우저에서 쓴 API 약 <b>${fmt.int(window.VR.youtube.quotaUsed())}</b> / ${fmt.int(window.VR.youtube.DAILY_QUOTA)}유닛` : '데모 모드: 가상 데이터로 모읍니다.'}</span>
+              <span class="spacer"></span>
+              <button class="btn btn-sm btn-ghost" type="button" id="olClear" ${dis}>${ICON.trash}표본 비우기</button>
+            </div>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-h"><h3>2. 조건</h3></div>
+          <div class="panel-b ol-cond">
+            <div class="filter-group"><h4>구독자 범위 · 나와 비슷한 규모</h4>
+              <div class="ol-chips">${SUB_PRESETS.map(([a, b, l]) => `<button type="button" class="chip ${O.minSubs === a && O.maxSubs === b ? 'on' : ''}" data-subs="${a}|${b}">${l}</button>`).join('')}</div>
+              <div class="range" style="margin-top:8px"><input class="input input-sm" data-o="minSubs" value="${esc(O.minSubs)}" placeholder="최소 (예: 500)" aria-label="구독자 최소"/><span class="muted">~</span><input class="input input-sm" data-o="maxSubs" value="${esc(O.maxSubs)}" placeholder="최대 (예: 1만)" aria-label="구독자 최대"/></div></div>
+            <div class="filter-group"><h4>조회수가 구독자의 몇 배 이상</h4>${seg('mult', MULTS.map((m) => [m, m + '배']), O.mult)}</div>
+            <div class="filter-group"><h4>게시 기간</h4>${seg('period', PERIODS, O.period)}</div>
+            <div class="filter-group"><h4>형식</h4>${seg('format', FORMATS, O.format)}</div>
+            <div class="filter-group"><h4>최소 조회수 · 포함 키워드</h4><div class="range"><input class="input input-sm" data-o="minViews" value="${esc(O.minViews)}" placeholder="최소 조회수" style="max-width:120px" aria-label="최소 조회수"/><input class="input input-sm" data-o="kw" value="${esc(O.kw)}" placeholder="제목·태그 포함 (쉼표 = 또는)" aria-label="포함 키워드"/></div></div>
+          </div>
+        </section>
+      </div>
+      <div id="olBody"><div class="sk" style="height:120px;margin-top:18px"></div></div>`;
+    bindOutlierEvents();
+    fillOutliers();
+  }
+
+  async function fillOutliers() {
+    const mode = S.provider.mode;
+    const p = await pool.load(mode);
+    if (currentRoute() !== 'outliers' || S.provider.mode !== mode) return;
+    const stat = document.getElementById('olStat');
+    if (stat) stat.textContent = `표본 영상 ${fmt.int(p.videos.size)}개 · 채널 ${fmt.int(p.channels.size)}개${p.persistent ? '' : ' (이번 방문 동안만 보관)'}`;
+    const body = document.getElementById('olBody');
+    if (!body) return;
+    if (!p.videos.size) {
+      body.innerHTML = `<div class="empty" style="margin-top:18px"><b>아직 표본이 없습니다</b>위에서 ‘핫 비디오 전체’나 ‘키워드 깊게 검색’으로 표본을 모으세요.<br/>영상 찾기와 채널 분석에서 불러온 영상도 표본에 자동으로 쌓입니다.</div>`;
+      return;
+    }
+    const O = outlierSettings();
+    const r = computeOutliers(p, O);
+    const list = outlierList();
+    list.numeric = true;
+    list.view = S.settings.view;
+    list.items = r.items;
+    for (const id of [...list.selected]) if (!r.items.some((v) => v.id === id)) list.selected.delete(id);
+    const none = r.matched
+      ? `조건에 맞는 영상 ${fmt.int(r.matched)}개 중 조회수가 구독자의 ${O.mult}배를 넘은 영상이 없습니다.<br/>배수를 낮추거나 게시 기간을 넓혀 보세요.`
+      : '구독자 범위·기간·형식에 맞는 영상이 표본에 없습니다.<br/>내 분야 키워드로 ‘키워드 깊게 검색’을 해서 비슷한 규모 채널의 영상을 더 모아 보세요.';
+    body.innerHTML = `
+      <div class="toolbar">
+        <div class="result-title">아웃라이어 ${fmt.int(r.items.length)}개 <small>조건에 맞는 영상 ${fmt.int(r.matched)}개 · 채널 ${fmt.int(r.channels)}개 중</small></div>
+        <div class="spacer"></div>
+        <span class="muted" id="olSel" style="font-size:12.5px">${list.selected.size ? `${list.selected.size}개 선택됨` : ''}</span>
+        <button class="btn btn-sm" id="olCollect">${ICON.save}영상 수집</button>
+        <button class="btn btn-sm" id="olToA">${ICON.chart}채널 분석에 추가</button>
+        <button class="btn btn-sm" id="olCsv">${ICON.down}CSV</button>
+        <div class="segmented" data-oview><button type="button" data-v="table" class="${S.settings.view === 'table' ? 'on' : ''}" aria-label="표 보기">${ICON.table}표</button><button type="button" data-v="card" class="${S.settings.view === 'card' ? 'on' : ''}" aria-label="카드 보기">${ICON.grid}카드</button></div>
+      </div>
+      ${r.items.length ? '<p class="muted ol-hint">기여도 = 조회수 ÷ 구독자(배). 열 제목을 눌러 정렬을 바꿀 수 있습니다.</p>' : `<div class="empty"><b>아웃라이어가 없습니다</b>${none}</div>`}
+      <div id="olList"></div>`;
+    if (r.items.length) list.mount(body.querySelector('#olList'));
+    body.querySelector('#olCollect').addEventListener('click', () => collectVideos(list.selectedItems()));
+    body.querySelector('#olToA').addEventListener('click', () => {
+      const sel = list.selectedItems();
+      if (!sel.length) { toast('채널 분석에 추가할 영상을 먼저 선택해 주세요.'); return; }
+      addChannelsForAnalysis(sel);
+    });
+    body.querySelector('#olCsv').addEventListener('click', () => {
+      const sel = list.selectedItems();
+      const items = sel.length ? sel : list.sorted();
+      if (!items.length) { toast('내보낼 영상이 없습니다.'); return; }
+      ui.downloadCsv(`viewradar_outliers_${new Date().toISOString().slice(0, 10)}.csv`, items);
+      toast(`${items.length}개 영상을 CSV로 저장했습니다.`);
+    });
+    body.querySelector('[data-oview]').addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-v]');
+      if (!b) return;
+      S.settings = store.saveSettings({ view: b.getAttribute('data-v') });
+      fillOutliers();
+    });
+  }
+
+  function bindOutlierEvents() {
+    view.querySelector('#olHot').addEventListener('click', () => runOutlierCollect('hot'));
+    const form = view.querySelector('#olSearch');
+    const updateCost = () => {
+      const el = document.getElementById('olCost');
+      if (el) el.textContent = `약 ${fmt.int(searchCost(outlierSettings().depth, Math.max(1, splitKeywords(form.kws.value).length)))}유닛`;
+    };
+    form.addEventListener('submit', (e) => { e.preventDefault(); saveOutlier({ kws: form.kws.value.trim() }); runOutlierCollect('search'); });
+    form.kws.addEventListener('input', updateCost);
+    form.kws.addEventListener('change', () => saveOutlier({ kws: form.kws.value.trim() }));
+    view.querySelectorAll('[data-oseg]').forEach((seg) => seg.addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-v]');
+      if (!b) return;
+      const key = seg.getAttribute('data-oseg');
+      const raw = b.getAttribute('data-v');
+      saveOutlier({ [key]: key === 'mult' ? +raw : raw });
+      if (key === 'depth') {
+        seg.querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+        updateCost();
+        return;
+      }
+      renderOutliers();
+    }));
+    view.querySelectorAll('[data-subs]').forEach((b) => b.addEventListener('click', () => {
+      const [a, c] = b.getAttribute('data-subs').split('|');
+      saveOutlier({ minSubs: a, maxSubs: c });
+      renderOutliers();
+    }));
+    view.querySelectorAll('[data-o]').forEach((inp) => inp.addEventListener('change', () => {
+      const k = inp.getAttribute('data-o');
+      const val = inp.value.trim();
+      if (k !== 'kw' && val && parseKo(val) == null) { toast('숫자 또는 1만, 3천 형식으로 입력해 주세요.', 'err'); return; }
+      saveOutlier({ [k]: val });
+      renderOutliers();
+    }));
+    view.querySelector('#olClear').addEventListener('click', async () => {
+      if (!(await ui.confirmDialog('모아 둔 표본(영상·채널)을 모두 지울까요? 수집한 영상 폴더는 그대로 남습니다.', '표본 비우기'))) return;
+      await pool.clear(S.provider.mode);
+      toast('표본을 비웠습니다.');
+      renderOutliers();
+    });
+  }
+
+  async function runOutlierCollect(kind) {
+    const st = S.outliers;
+    if (st.busy) return;
+    const O = outlierSettings();
+    const region = S.settings.region;
+    const mode = S.provider.mode;
+    let keywords = [];
+    if (kind === 'search') {
+      keywords = splitKeywords(O.kws);
+      if (!keywords.length) { toast('키워드를 하나 이상 입력해 주세요.'); return; }
+      if (mode === 'api') {
+        const cost = searchCost(O.depth, keywords.length);
+        const left = window.VR.youtube.DAILY_QUOTA - window.VR.youtube.quotaUsed();
+        if (cost > left && !(await ui.confirmDialog(`예상 사용량(약 ${fmt.int(cost)}유닛)이 오늘 남은 양(약 ${fmt.int(Math.max(0, left))}유닛)보다 많습니다. 중간에 할당량이 끝나면 그때까지 모은 영상만 표본에 남습니다. 계속할까요?`, '계속'))) return;
+      }
+    }
+    st.busy = true;
+    st.pct = 0;
+    st.progress = kind === 'hot' ? '카테고리 목록을 불러오는 중…' : '검색을 시작하는 중…';
+    if (currentRoute() === 'outliers') renderOutliers();
+    const before = (await pool.stats(mode)).videos;
+    const onProgress = (p) => {
+      st.pct = Math.min(100, Math.round((p.done / p.total) * 100));
+      st.progress = `${kind === 'hot' ? '카테고리' : '검색'} ${Math.floor(p.done)}/${p.total} · 영상 ${fmt.int(p.videos)}개`;
+      const el = document.getElementById('olProg');
+      if (el) el.innerHTML = progressHtml();
+    };
+    try {
+      if (kind === 'hot') await collectHot(region, onProgress);
+      else await collectSearch(keywords, { depth: O.depth, period: O.period, region }, onProgress);
+      const after = (await pool.stats(mode)).videos;
+      toast(`표본에 새 영상 ${fmt.int(after - before)}개를 더했습니다.`);
+    } catch (e) {
+      toast(errMsg(e) + ' 그때까지 모은 영상은 표본에 남았습니다.', 'err');
+    } finally {
+      st.busy = false;
+      st.progress = '';
+      st.pct = 0;
+      if (currentRoute() === 'outliers') renderOutliers();
+    }
+  }
+
+  // ======================================================================
   // 설정
   // ======================================================================
   function openSettings() {
@@ -755,10 +1108,10 @@
       <div class="callout" style="margin-bottom:16px">
         <b>API 키 발급 방법 (무료)</b>
         <ol class="steps"><li>Google Cloud Console(console.cloud.google.com)에서 프로젝트를 만듭니다.</li><li>‘API 및 서비스 → 라이브러리’에서 <b>YouTube Data API v3</b>를 사용 설정합니다.</li><li>‘사용자 인증 정보 → API 키 만들기’로 키를 만든 뒤 붙여 넣습니다.</li></ol>
-        <div style="margin-top:6px">기본 할당량은 하루 10,000유닛입니다. 영상 검색 1회(50개)는 약 102유닛, 핫 비디오·채널 분석은 2~5유닛을 씁니다.</div>
+        <div style="margin-top:6px">기본 할당량은 하루 10,000유닛입니다. 영상 검색 1회(50개)는 약 102유닛, 핫 비디오 전체는 약 60~150유닛, 채널 분석은 2~5유닛을 씁니다.${s.apiKey ? ` 오늘 이 브라우저에서 쓴 양: 약 <b>${fmt.int(window.VR.youtube.quotaUsed())}</b>유닛.` : ''}</div>
       </div>
       <div class="form-row"><label for="regionSel">기본 국가</label><select id="regionSel" class="select">${REGIONS.map(([c, n]) => `<option value="${c}" ${c === s.region ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
-      <div class="form-row"><label>저장 데이터</label><div><button class="btn btn-sm" type="button" id="resetData">${ICON.trash}수집 영상·채널 목록·측정 기록 초기화</button></div></div>
+      <div class="form-row"><label>저장 데이터</label><div><button class="btn btn-sm" type="button" id="resetData">${ICON.trash}수집 영상·채널 목록·측정 기록·표본 초기화</button></div></div>
     </div>`);
     const footer = h('<div style="display:contents"><button class="btn" data-close>취소</button><button class="btn btn-primary" id="saveSettings">저장</button></div>');
     const m = modal({ title: '설정', body, footer, size: 'sm' });
@@ -776,8 +1129,9 @@
       finally { e.target.disabled = false; e.target.textContent = '연결 테스트'; }
     });
     m.el.querySelector('#resetData').addEventListener('click', async () => {
-      if (!(await ui.confirmDialog('수집한 영상, 채널 분석 목록, 조회수 측정 기록을 모두 지웁니다. API 키와 화면 설정은 유지됩니다.', '초기화'))) return;
+      if (!(await ui.confirmDialog('수집한 영상, 채널 분석 목록, 조회수 측정 기록, 아웃라이어 표본을 모두 지웁니다. API 키와 화면 설정은 유지됩니다.', '초기화'))) return;
       ['folders', 'channels', 'snaps', 'demoChannels'].forEach((k) => localStorage.removeItem('viewradar:' + k));
+      await Promise.all([pool.clear('api'), pool.clear('demo')]);
       S.analysis = { selectedId: null, cache: {}, loading: false, error: '', list: null };
       S.saved = { folderId: 'default', list: null };
       updateSavedCount();
@@ -803,7 +1157,7 @@
   // ---------- 라우터 ----------
   function currentRoute() {
     const r = (location.hash.replace(/^#\/?/, '') || 'videos').split('/')[0];
-    return ['videos', 'channels', 'analysis', 'saved'].includes(r) ? r : 'videos';
+    return ['videos', 'outliers', 'channels', 'analysis', 'saved'].includes(r) ? r : 'videos';
   }
   function route() {
     const r = currentRoute();
@@ -812,9 +1166,9 @@
       a.classList.toggle('active', on);
       if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
     });
-    const titles = { videos: '영상 찾기', channels: '채널 찾기', analysis: '채널 분석', saved: '수집한 영상' };
+    const titles = { videos: '영상 찾기', outliers: '아웃라이어 찾기', channels: '채널 찾기', analysis: '채널 분석', saved: '수집한 영상' };
     document.title = titles[r] + ' · 뷰레이더';
-    ({ videos: renderVideos, channels: renderChannels, analysis: renderAnalysis, saved: renderSaved })[r]();
+    ({ videos: renderVideos, outliers: renderOutliers, channels: renderChannels, analysis: renderAnalysis, saved: renderSaved })[r]();
   }
 
   // ---------- 시작 ----------
